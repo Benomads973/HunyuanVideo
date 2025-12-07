@@ -148,13 +148,14 @@ class Inference(object):
         Args:
             pretrained_model_path (str or pathlib.Path): The model path, including t2v, text encoder and vae checkpoints.
             args (argparse.Namespace): The arguments for the pipeline.
-            device (int): The device for inference. Default is 0.
+            device (int/str/torch.device): The device for inference.
         """
         # ========================================================================
         logger.info(f"Got text-to-video model root path: {pretrained_model_path}")
         
         # ==================== Initialize Distributed Environment ================
         if args.ulysses_degree > 1 or args.ring_degree > 1:
+            # ⚠️ On ne touche PAS au mode distribué : il attend du full-GPU
             assert xfuser is not None, \
                 "Ulysses Attention and Ring Attention requires xfuser package."
 
@@ -175,10 +176,14 @@ class Inference(object):
             )
             device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
         else:
+            # Chemin mono-GPU classique
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        parallel_args = {"ulysses_degree": args.ulysses_degree, "ring_degree": args.ring_degree}
+        parallel_args = {
+            "ulysses_degree": args.ulysses_degree,
+            "ring_degree": args.ring_degree,
+        }
 
         # ======================== Get the args path =============================
 
@@ -187,21 +192,53 @@ class Inference(object):
 
         # =========================== Build main model ===========================
         logger.info("Building model...")
-        factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
+
+        # 🔴 POINT CLE :
+        # - en mode use_cpu_offload + mono-GPU, on construit le modèle sur CPU
+        #   (pour éviter l'OOM pendant l'init des gros Linear)
+        # - sinon, on garde le device normal (cuda / distrib)
+        if (
+            args.use_cpu_offload
+            and (args.ulysses_degree == 1 and args.ring_degree == 1)
+            and torch.cuda.is_available()
+        ):
+            model_device = "cpu"
+        else:
+            model_device = device
+
+        factor_kwargs = {
+            "device": model_device,
+            "dtype": PRECISION_TO_TYPE[args.precision],
+        }
         in_channels = args.latent_channels
         out_channels = args.latent_channels
 
+        # Construction du DiT sur model_device (CPU en offload, sinon device)
         model = load_model(
             args,
             in_channels=in_channels,
             out_channels=out_channels,
             factor_kwargs=factor_kwargs,
         )
+
+        # FP8 conversion (peut s'appliquer sur CPU, pas besoin de CUDA ici)
         if args.use_fp8:
-            convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
-        model = model.to(device)
+            convert_fp8_linear(
+                model,
+                args.dit_weight,
+                original_dtype=PRECISION_TO_TYPE[args.precision],
+            )
+
+        # Chargement des poids
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
+
+        # ⚠️ Très important :
+        # - en mode CPU offload, on LAISSE le modèle sur CPU.
+        #   HunyuanVideoPipeline.enable_sequential_cpu_offload() gérera les moves.
+        # - sinon, on place tout sur device (cuda / distrib).
+        if not args.use_cpu_offload:
+            model = model.to(device)
 
         # ============================= Build extra models ========================
         # VAE
@@ -273,8 +310,9 @@ class Inference(object):
             use_cpu_offload=args.use_cpu_offload,
             device=device,
             logger=logger,
-            parallel_args=parallel_args
+            parallel_args=parallel_args,
         )
+
 
     @staticmethod
     def load_state_dict(args, model, pretrained_model_path):
