@@ -1,5 +1,6 @@
-import importlib.metadata
+import os
 import math
+import importlib.metadata
 
 import torch
 import torch.nn as nn
@@ -17,10 +18,12 @@ except ImportError:
 
 MEMORY_LAYOUT = {
     "flash": (
+        # [b, s, h, d] → [(b*h), s, d]
         lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
         lambda x: x,
     ),
     "torch": (
+        # [b, s, h, d] → [b, h, s, d]
         lambda x: x.transpose(1, 2),
         lambda x: x.transpose(1, 2),
     ),
@@ -29,6 +32,27 @@ MEMORY_LAYOUT = {
         lambda x: x.transpose(1, 2),
     ),
 }
+
+
+# =====================================================================
+# Helpers
+# =====================================================================
+
+def _can_use_flash_attn() -> bool:
+    """Retourne True si on PEUT utiliser flash-attn dans de bonnes conditions."""
+    if flash_attn is None or flash_attn_varlen_func is None:
+        return False
+    if os.environ.get("HYVIDEO_DISABLE_FLASH_ATTN", "0") == "1":
+        return False
+    if not torch.cuda.is_available():
+        return False
+
+    # On force Ampere+ (sm_80 minimum) pour être safe
+    major, minor = torch.cuda.get_device_capability()
+    if major < 8:
+        return False
+
+    return True
 
 
 def get_cu_seqlens(text_mask, img_len):
@@ -57,6 +81,10 @@ def get_cu_seqlens(text_mask, img_len):
     return cu_seqlens
 
 
+# =====================================================================
+# Core attention
+# =====================================================================
+
 def attention(
     q,
     k,
@@ -75,55 +103,78 @@ def attention(
     Perform QKV self attention.
 
     Args:
-        q (torch.Tensor): Query tensor with shape [b, s, a, d], where a is the number of heads.
-        k (torch.Tensor): Key tensor with shape [b, s1, a, d]
-        v (torch.Tensor): Value tensor with shape [b, s1, a, d]
-        mode (str): Attention mode. Choose from 'self_flash', 'cross_flash', 'torch', and 'vanilla'.
-        drop_rate (float): Dropout rate in attention map. (default: 0)
-        attn_mask (torch.Tensor): Attention mask with shape [b, s1] (cross_attn), or [b, a, s, s1] (torch or vanilla).
-            (default: None)
-        causal (bool): Whether to use causal attention. (default: False)
-        cu_seqlens_q (torch.Tensor): dtype torch.int32. The cumulative sequence lengths of the sequences in the batch,
-            used to index into q.
-        cu_seqlens_kv (torch.Tensor): dtype torch.int32. The cumulative sequence lengths of the sequences in the batch,
-            used to index into kv.
-        max_seqlen_q (int): The maximum sequence length in the batch of q.
-        max_seqlen_kv (int): The maximum sequence length in the batch of k and v.
+        q (torch.Tensor): [b, s, h, d]
+        k (torch.Tensor): [b, s1, h, d]
+        v (torch.Tensor): [b, s1, h, d]
+        mode (str): 'flash', 'torch', 'vanilla'
+        drop_rate (float): dropout rate on attention map
+        attn_mask (torch.Tensor): see comment dans le code
+        causal (bool): causal attention
+        cu_seqlens_q / cu_seqlens_kv: pour flash-attn varlen
+        max_seqlen_q / max_seqlen_kv: idem
 
     Returns:
-        torch.Tensor: Output tensor after self attention with shape [b, s, ad]
+        torch.Tensor: [b, s, h*d]
     """
+
+    # -----------------------------------------------------------------
+    # PATCH pour ton contexte :
+    # - si mode == "flash" mais flash-attn inutilisable → fallback "torch"
+    # -----------------------------------------------------------------
+    if mode == "flash" and not _can_use_flash_attn():
+        # Tu peux logger ici si tu veux voir le fallback :
+        # print("[HunyuanVideo] FlashAttention indisponible → fallback sur 'torch'")
+        mode = "torch"
+
+    if mode not in MEMORY_LAYOUT:
+        raise NotImplementedError(f"Unsupported attention mode: {mode}")
+
     pre_attn_layout, post_attn_layout = MEMORY_LAYOUT[mode]
-    q = pre_attn_layout(q)
+    q = pre_attn_layout(q)  # e.g. [b, s, h, d] → [b, h, s, d] ou (b*h, s, d)
     k = pre_attn_layout(k)
     v = pre_attn_layout(v)
 
+    # -----------------------------------------------------------------
+    # Mode PyTorch (scaled_dot_product_attention)
+    # -----------------------------------------------------------------
     if mode == "torch":
+        # q, k, v: [b, h, s, d]
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
+
         if cu_seqlens_q is None:
+            # Cas standard : pas de séquences varlen
             x = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
             )
         else:
+            # Cas Hunyuan : on split texte / image via les cu_seqlens
             attn1 = F.scaled_dot_product_attention(
                 q[:, :, :cu_seqlens_q[1]],
                 k[:, :, :cu_seqlens_kv[1]],
                 v[:, :, :cu_seqlens_kv[1]],
                 attn_mask=attn_mask,
                 dropout_p=drop_rate,
-                is_causal=causal
+                is_causal=causal,
             )
             attn2 = F.scaled_dot_product_attention(
-                q[:, :, cu_seqlens_q[1]:],
-                k[:, :, cu_seqlens_kv[1]:],
-                v[:, :, cu_seqlens_kv[1]:],
+                q[:, :, cu_seqlens_q[1] :],
+                k[:, :, cu_seqlens_kv[1] :],
+                v[:, :, cu_seqlens_kv[1] :],
                 attn_mask=None,
                 dropout_p=drop_rate,
-                is_causal=False
+                is_causal=False,
             )
             x = torch.cat([attn1, attn2], dim=2)
+
+    # -----------------------------------------------------------------
+    # Mode FlashAttention (varlen)
+    # -----------------------------------------------------------------
     elif mode == "flash":
+        # ici on sait que _can_use_flash_attn() == True
+        if cu_seqlens_q is None or cu_seqlens_kv is None:
+            raise ValueError("Flash mode requires cu_seqlens_q and cu_seqlens_kv")
+
         x = flash_attn_varlen_func(
             q,
             k,
@@ -133,24 +184,29 @@ def attention(
             max_seqlen_q,
             max_seqlen_kv,
         )
-        # x with shape [(bxs), a, d]
+        # x: [(b*h*s), d] ou [(b*s), h, d] selon layout
         x = x.view(
             batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
-        )  # reshape x to [b, s, a, d]
-    elif mode == "vanilla":
-        scale_factor = 1 / math.sqrt(q.size(-1))
+        )  # [b, s, h, d]
 
-        b, a, s, _ = q.shape
+    # -----------------------------------------------------------------
+    # Mode vanilla (matmul + softmax)
+    # -----------------------------------------------------------------
+    elif mode == "vanilla":
+        scale_factor = 1.0 / math.sqrt(q.size(-1))  # d^-0.5
+
+        b, h, s, _ = q.shape
         s1 = k.size(2)
-        attn_bias = torch.zeros(b, a, s, s1, dtype=q.dtype, device=q.device)
+        attn_bias = torch.zeros(b, h, s, s1, dtype=q.dtype, device=q.device)
+
         if causal:
-            # Only applied to self attention
+            # Causal uniquement pour self-attn
             assert (
                 attn_mask is None
             ), "Causal mask and attn_mask cannot be used together"
-            temp_mask = torch.ones(b, a, s, s, dtype=torch.bool, device=q.device).tril(
-                diagonal=0
-            )
+            temp_mask = torch.ones(
+                b, h, s, s, dtype=torch.bool, device=q.device
+            ).tril(diagonal=0)
             attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
             attn_bias.to(q.dtype)
 
@@ -160,20 +216,24 @@ def attention(
             else:
                 attn_bias += attn_mask
 
-        # TODO: Maybe force q and k to be float32 to avoid numerical overflow
         attn = (q @ k.transpose(-2, -1)) * scale_factor
         attn += attn_bias
         attn = attn.softmax(dim=-1)
         attn = torch.dropout(attn, p=drop_rate, train=True)
         x = attn @ v
+
     else:
         raise NotImplementedError(f"Unsupported attention mode: {mode}")
 
-    x = post_attn_layout(x)
-    b, s, a, d = x.shape
-    out = x.reshape(b, s, -1)
+    x = post_attn_layout(x)  # revenir en [b, s, h, d]
+    b, s, h, d = x.shape
+    out = x.reshape(b, s, -1)  # [b, s, h*d]
     return out
 
+
+# =====================================================================
+# parallel_attention (xfuser + flash_attn) – plutôt pour gros GPU
+# =====================================================================
 
 def parallel_attention(
     hybrid_seq_parallel_attn,
@@ -183,8 +243,34 @@ def parallel_attention(
     img_q_len,
     img_kv_len,
     cu_seqlens_q,
-    cu_seqlens_kv
+    cu_seqlens_kv,
 ):
+    """
+    Version hybride pour les configs avec xfuser + flash-attn.
+    Dans ton contexte (mono-GPU, pas Ampere), ce code ne devrait
+    normalement PAS être appelé (ulysses_degree=ring_degree=1).
+    """
+    # Sécurité : si pas de flash_attn ou GPU inadapté → on fallback sur
+    # la partie hybrid_seq_parallel_attn uniquement (sans second bloc).
+    if not _can_use_flash_attn() or _flash_attn_forward is None:
+        # Fallback simple : on applique juste l'attention hybride sur tout
+        # On concatène img + texte et on laisse hybrid_seq_parallel_attn gérer.
+        attn = hybrid_seq_parallel_attn(
+            None,
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            causal=False,
+            joint_tensor_query=None,
+            joint_tensor_key=None,
+            joint_tensor_value=None,
+            joint_strategy="rear",
+        )
+        b, s, h, d = attn.shape
+        return attn.reshape(b, s, -1)
+
+    # Cas "normal" prévu par HunyuanVideo (GPU massif / cluster)
     attn1 = hybrid_seq_parallel_attn(
         None,
         q[:, :img_q_len, :, :],
@@ -192,18 +278,21 @@ def parallel_attention(
         v[:, :img_kv_len, :, :],
         dropout_p=0.0,
         causal=False,
-        joint_tensor_query=q[:,img_q_len:cu_seqlens_q[1]],
-        joint_tensor_key=k[:,img_kv_len:cu_seqlens_kv[1]],
-        joint_tensor_value=v[:,img_kv_len:cu_seqlens_kv[1]],
+        joint_tensor_query=q[:, img_q_len : cu_seqlens_q[1]],
+        joint_tensor_key=k[:, img_kv_len : cu_seqlens_kv[1]],
+        joint_tensor_value=v[:, img_kv_len : cu_seqlens_kv[1]],
         joint_strategy="rear",
     )
-    if flash_attn.__version__ >= '2.7.0':
+
+    softmax_scale = q.shape[-1] ** (-0.5)
+
+    if flash_attn.__version__ >= "2.7.0":
         attn2, *_ = _flash_attn_forward(
-            q[:,cu_seqlens_q[1]:],
-            k[:,cu_seqlens_kv[1]:],
-            v[:,cu_seqlens_kv[1]:],
+            q[:, cu_seqlens_q[1] :],
+            k[:, cu_seqlens_kv[1] :],
+            v[:, cu_seqlens_kv[1] :],
             dropout_p=0.0,
-            softmax_scale=q.shape[-1] ** (-0.5),
+            softmax_scale=softmax_scale,
             causal=False,
             window_size_left=-1,
             window_size_right=-1,
@@ -213,19 +302,20 @@ def parallel_attention(
         )
     else:
         attn2, *_ = _flash_attn_forward(
-            q[:,cu_seqlens_q[1]:],
-            k[:,cu_seqlens_kv[1]:],
-            v[:,cu_seqlens_kv[1]:],
+            q[:, cu_seqlens_q[1] :],
+            k[:, cu_seqlens_kv[1] :],
+            v[:, cu_seqlens_kv[1] :],
             dropout_p=0.0,
-            softmax_scale=q.shape[-1] ** (-0.5),
+            softmax_scale=softmax_scale,
             causal=False,
             window_size=(-1, -1),
             softcap=0.0,
             alibi_slopes=None,
             return_softmax=False,
         )
+
     attn = torch.cat([attn1, attn2], dim=1)
-    b, s, a, d = attn.shape
+    b, s, h, d = attn.shape
     attn = attn.reshape(b, s, -1)
 
     return attn
