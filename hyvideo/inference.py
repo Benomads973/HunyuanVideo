@@ -152,7 +152,8 @@ class Inference(object):
         """
         # ========================================================================
         logger.info(f"Got text-to-video model root path: {pretrained_model_path}")
-        
+        pretrained_model_path = Path(pretrained_model_path)
+
         # ==================== Initialize Distributed Environment ================
         if args.ulysses_degree > 1 or args.ring_degree > 1:
             # Mode distribué (xfuser) : on ne touche pas au flux normal
@@ -193,10 +194,7 @@ class Inference(object):
         # =========================== Build main model ===========================
         logger.info("Building model...")
 
-        # 🔑 CLE :
-        # - si use_cpu_offload == True (et pas en distrib), on construit le modèle sur CPU
-        #   pour éviter l'OOM à l'init des gros Linear.
-        # - sinon, on garde l'ancien comportement (init directement sur device).
+        # 🔑 Init DiT sur CPU si offload activé (mono-GPU)
         if (
             args.use_cpu_offload
             and args.ulysses_degree == 1
@@ -243,16 +241,18 @@ class Inference(object):
             model = model.to(device)
 
         # ============================= Build extra models ========================
-        # VAE
+        # VAE : on force le chemin local <pretrained_model_path>/vae
+        vae_path = pretrained_model_path / "vae"
+        logger.info(f"Loading VAE from local path: {vae_path}")
         vae, _, s_ratio, t_ratio = load_vae(
-            args.vae,
+            str(vae_path),
             args.vae_precision,
             logger=logger,
             device=device if not args.use_cpu_offload else "cpu",
         )
         vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
 
-        # Text encoder
+        # Text encoder (on garde ta logique existante)
         if args.prompt_template_video is not None:
             crop_start = PROMPT_TEMPLATE[args.prompt_template_video].get(
                 "crop_start", 0
